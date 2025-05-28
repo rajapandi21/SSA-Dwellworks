@@ -1,3 +1,4 @@
+from numpy.core import numeric
 import streamlit as st
 from sqlalchemy import create_engine, text, inspect
 from langchain.agents import AgentExecutor
@@ -23,6 +24,7 @@ import time
 from urllib.parse import quote_plus
 import traceback
 from visual.app_visual import create_visualization
+from example_prompt import example_prompt_template
 
 # Import AWS Bedrock
 from langchain_community.chat_models import BedrockChat
@@ -334,8 +336,13 @@ def create_agent(llm, yaml_output):
                         - **Use the appropriate T-SQL syntax based on the YAML input** for the given database.  
                         - **Return only the T-SQL query** without any explanation.  
 
+                    Also You have access to this Example Queries: {example_prompt_template}. Please analyze the question carefully relevant to the Schema and give me results accordingly.
+
                     **Ensure T-SQL Query you are generating should be relevant to the YAML file**
                     **Carefully Check all Column names that are specific to tables and do Joins if required between tables**
+
+                    **If any Questions asked related to Bed Rooms instead of '1 BR', '2 BR', There is no values in the database like 1BR, 2BR. You should return '1 Bedroom' , '2 Bedroom' etc.**
+                    **Example: Select * from dbo.CHKPI_APT_DIMENSION where Bedrooms = '1 Bedroom'**
 
                     **Formulae for Calculation:**
                     AverageNightlyRate:  
@@ -354,6 +361,10 @@ def create_agent(llm, yaml_output):
                             Table: CHKPI_OPTY_FACT 
                             Formula: ROUND((SUM(RentedOptyCount * 1.0) / NULLIF(SUM(OptyCount * 1.0), 0)) * 100, 0) 
 
+                        Anything Questions Related to Suppliers use this convertion rate formula
+                            Table: CHKPI_RFH_SUPPLIER_REQUEST_RESPONSE
+                            Formula: SUM(BookedCount * 1.0) / count(distinct opti_id)
+
                     **Please use the above formulae for calculation of AverageNightlyRate, ALOS, ADR and Conversion Rate**
 
                     **⚠️ CRITICAL TABLE ALIAS GUIDELINES:**
@@ -369,6 +380,16 @@ def create_agent(llm, yaml_output):
                         - NEVER DEVIATE FROM THESE EXACT ALIASES - this is critical to prevent SQL errors
                         - NEVER use any real English words or T-SQL reserved keywords as table aliases
                         - ALWAYS use these specified table aliases for all column references (e.g., C1.CustomerName, T1.MonthlyRentUSD)
+
+                    **"⚠️CRITICAL DATE AND MONTH ORDERING GUIDELINES"** that specifically addresses:
+                        1. The need to include month/date columns in both SELECT and GROUP BY clauses
+                        2. How to ensure proper chronological ordering with FORMAT functions
+                        3. Best practices for queries spanning multiple years
+
+                        This addition will guide the SQL agent to generate queries that:
+                        - Comply with SQL Server's GROUP BY requirements
+                        - Ensure proper chronological ordering of results
+                        - Work seamlessly with the visualization pipeline
 
                     **⚠️Key Restriction: For any schema-related queries (e.g., "show schema", "table structure", "list columns", "display schema of ...", etc.), 
                     Do not display the result in the UI. Instead, simply return 'None'**
@@ -400,6 +421,7 @@ def create_agent(llm, yaml_output):
         ]
     ).partial(
         yaml_output=yaml_output,
+        example_prompt_template=example_prompt_template,
     )
     
     tools = []
@@ -747,6 +769,13 @@ def sql_main():
                             4. Rates or percentages (rate, percentage, ratio, etc.)
                             5. Any other numerical columns that would provide meaningful insights
 
+                            GROUP COLUMN SELECTION PRIORITIES (for clustered bar charts):
+                            1. Categorical columns with few unique values (2-6 categories).
+                            2. Boolean or binary columns (yes/no, true/false).
+                            3. Categorical columns that naturally segment the data (status, type, category).
+                            4. Columns that would provide meaningful comparison across X-axis categories.
+                            5. IMPORTANT: Always include a group_col in your response when suggesting clustered_bar visualization type.
+
                             **VISUALIZATION TYPE SELECTION RULES:**
                             - Line chart: For time series data or showing trends over a continuous variable
                             - Bar chart: For comparing categorical data or showing ranking
@@ -758,6 +787,7 @@ def sql_main():
                             - Area chart: For cumulative totals over time or stacked composition changes
                             - Bubble chart: When a third numerical dimension is important
                             - Grouped/stacked bar: For comparing multiple categories or subcategories
+                            - Clustered bar: For comparing values across multiple categories with a grouping variable.
 
                             ADDITIONAL RULES:
                             - Never suggest the same column for both X and Y axes
@@ -765,9 +795,18 @@ def sql_main():
                             - If multiple time columns exist, choose the one with appropriate granularity
                             - Consider natural relationships between variables (e.g., time and sales)
                             - Avoid using unique identifiers as X-axis if there are better categorical options
+                            - For clustered bar charts, identify a suitable grouping column with few unique values.
 
                             **Output format:**
-                            Return only a valid JSON object with these exact keys: x_axis, y_axis, and visualization.
+                            **Output format (always return JSON):**
+                            ```json
+                                {{
+                                "x_axis": <Predictred X-axis column name>,
+                                "y_axis": <Predicted Y-axis column name>,   
+                                "visualization": <Suggested visualizatio n type>,
+                                "group_col": <Suggested grouping column for clustered bar charts (optional)>
+                                }}
+                    ```
                             '''
 
                             # Get the response from the LLM
@@ -806,6 +845,197 @@ def sql_main():
                                 return None
 
                             # Try to extract JSON from the response
+                            # Alternative advanced prompt for even better summarization
+                            def generate_advanced_summary(df, user_query, llm):
+                                """
+                                Advanced summarization with better context understanding
+                                """
+                                try:
+                                    # Analyze the query type
+                                    query_analysis_prompt = f'''
+                                    Analyze this user query and categorize it:
+                                    Query: "{user_query}"
+                                    
+                                    Categorize as:
+                                    1. COMPARISON (comparing entities)
+                                    2. SUPERLATIVE (best/worst/highest/lowest)
+                                    3. AGGREGATION (sum/count/average)
+                                    4. LOOKUP (finding specific information)
+                                    5. TREND (time-based analysis)
+                                    6. OTHER
+                                    
+                                    Also identify:
+                                    - Key entities mentioned (products, regions, people, etc.)
+                                    - Metrics of interest (sales, revenue, count, etc.)
+                                    - Time periods (if any)
+                                    - Specific conditions or filters
+                                    
+                                    Format: Category|Entities|Metrics|Context
+                                    '''
+                                    
+                                    analysis_response = llm.invoke(query_analysis_prompt)
+                                    analysis_parts = analysis_response.content.split('|')
+                                    query_category = analysis_parts[0] if len(analysis_parts) > 0 else "OTHER"
+                                    
+                                    # Generate contextual summary
+                                    contextual_prompt = f'''
+                                    Create a natural language summary for this {query_category} query.
+                                    
+                                    Original Question: "{user_query}"
+                                    Query Type: {query_category}
+                                    
+                                    Results Data:
+                                    {df.to_string(max_rows=5)}
+                                    
+                                    Guidelines:
+                                    1. Start with a direct answer to the question
+                                    2. Use **bold** for key numbers and entities
+                                    3. Apply proper formatting:
+                                    - Currency: $X,XXX.XX
+                                    - Percentages: XX.X%
+                                    - Large numbers: X,XXX,XXX
+                                    4. For {query_category} queries, emphasize the key insight
+                                    5. Be conversational and precise
+                                    6. Maximum 2-3 sentences
+                                    7.For TREND queries:
+                                        - Highlight starting/ending values
+                                        - Mention peaks and troughs with dates
+                                        - Describe overall trend direction
+                                    
+                                    Example formats:
+                                    - SUPERLATIVE: "**EntityName** has the highest/lowest MetricName at **$X,XXX**"
+                                    - AGGREGATION: "The average MetricName is **$X,XXX** across all entities"
+                                    - COMPARISON: "**Entity1** outperforms **Entity2** with **X%** vs **Y%**"
+                                    '''
+                                    
+                                    summary_response = llm.invoke(contextual_prompt)
+                                    return summary_response.content.strip()
+                                    
+                                except Exception as e:
+                                    print(f"Advanced summary error: {e}")
+                                    return generate_intelligent_summary(df, user_query, llm)  # Fallback to basic summary
+                            def generate_intelligent_summary(df, user_query, llm):
+                                """
+                                Generate an intelligent summary of the SQL results using LLM
+                                """
+                                try:
+                                    # Pre-format numeric values for better LLM understanding
+                                    formatted_sample_data = []
+                                    if len(df) > 0:
+                                        for row in df.head(3).to_dict('records'):
+                                            formatted_row = {}
+                                            for col, value in row.items():
+                                                if isinstance(value, (int, float)) and not pd.isna(value):
+                                                    formatted_row[col] = format_value_intelligently(col, value, llm)
+                                                else:
+                                                    formatted_row[col] = value
+                                            formatted_sample_data.append(formatted_row)
+                                    
+                                    # Prepare data summary for the LLM
+                                    data_summary = {
+                                        "row_count": len(df),
+                                        "column_count": len(df.columns),
+                                        "columns": df.columns.tolist(),
+                                        "sample_data": formatted_sample_data,
+                                        "data_types": df.dtypes.to_dict()
+                                    }
+                                    
+                                    # Prepare the dataset string outside the f-string
+                                    if len(df) <= 10:
+                                        dataset_str = df.to_string(max_rows=10)
+                                    else:
+                                        dataset_str = df.to_string(max_rows=5) + "\n... (showing first 5 rows)"
+                                    
+                                    # Create a comprehensive prompt for summarization
+                                    summarization_prompt = f'''
+                                    You are an expert data analyst tasked with creating a concise, natural language summary of SQL query results.
+                                    
+                                    **User's Original Question:** {user_query}
+                                    
+                                    **Query Results Summary:**
+                                    - Total rows returned: {data_summary["row_count"]}
+                                    - Columns: {", ".join(data_summary["columns"])}
+                                    - Sample data: {data_summary["sample_data"]}
+                                    
+                                    **Full Dataset:** 
+                                    {dataset_str}
+                                    
+                                    **Instructions:**
+                                    1. Create a natural, conversational summary that directly answers the user's question
+                                    2. Use appropriate formatting with **bold** for emphasis on key numbers/values
+                                    3. Apply correct symbols and formatting:
+                                        - Money/Currency: Use $ symbol (e.g., $1,234.56)
+                                        - Percentages: Use % symbol (e.g., 85.5%)
+                                        - Large numbers: Use comma separators (e.g., 1,234,567)
+                                        - Decimals: Round to 2 decimal places where appropriate
+                                    4. For single results, provide a direct answer
+                                    5. For multiple results, highlight key insights or patterns
+                                    6. Keep the summary concise (1-3 sentences max)
+                                    7. Match the tone to the question type (comparative, superlative, average, count, etc.)
+                                    8. If data contains time-based columns (months, years), highlight trends, peaks, and lowest points
+                                    9. Mention start/end values and notable fluctuations
+                                    10.For time-series data:
+                                        - Highlight starting/ending values
+                                        - Mention peaks and troughs with dates
+                                        - Describe overall trend direction
+                                        - Note significant fluctuations
+                                    11.Ensure perfect spacing between words and numbers
+                                    12.Never split words across lines or combine separate words
+                                    13.Avoid using asterisks (*) for anything except multiplication when explicitly needed
+                                    14.Format months and dates correctly (e.g., "in January", "during Q1")
+
+
+                                    
+                                    **Column Formatting Guidelines:**
+                                    - Columns containing 'price', 'cost', 'revenue', 'income', 'expense', 'budget', 'payment', 'fee', 'salary', 'wage', 'amount', 'rate' → Format as currency ($)
+                                    - Columns containing 'percentage', 'percent', 'ratio', 'conversion', 'yield', 'return', 'margin' → Format as percentage (%)
+                                    - Columns containing 'count', 'number', 'quantity', 'total', 'sum' → Format with commas for large numbers
+                                    
+                                    **Response Format:**
+                                    Provide ONLY the summary text without any prefixes like "Summary:" or explanations.
+                                    Ensure perfect spacing and formatting - this will be displayed directly to users.
+                                    '''
+                                    
+                                    # Get summary from LLM
+                                    summary_response = llm.invoke(summarization_prompt)
+                                    return summary_response.content.strip()
+                                    
+                                except Exception as e:
+                                    print(f"Error generating summary: {e}")
+                                    return None
+
+                            def format_value_intelligently(column_name, value, llm):
+                                """
+                                Use LLM to determine the best formatting for a value based on column name and context
+                                """
+                                try:
+                                    if pd.isna(value) or not isinstance(value, (int, float)):
+                                        return str(value)
+                                        
+                                    formatting_prompt = f'''
+                                    You are a data formatting expert. Given a column name and numeric value, determine the best formatting.
+                                    
+                                    Column Name: {column_name}
+                                    Value: {value}
+                                    
+                                    Rules:
+                                    1. Money/Currency columns (price, cost, revenue, income, expense, budget, payment, fee, salary, wage, amount, nightly_rate, daily_rate, etc.) → Format as: $X,XXX.XX
+                                    2. Percentage columns (percentage, percent, ratio, conversion, yield, return, margin, rate_percent, etc.) → Format as: XX.XX%
+                                    3. Count/Quantity columns (count, number, quantity, total, sum, qty) → Format as: X,XXX (with commas)
+                                    4. Other numeric columns → Format as: X,XXX.XX (with commas and 2 decimals if needed)
+                                    
+                                    For percentage columns: If value is between 0-1, multiply by 100. If already >1, use as-is.
+                                    
+                                    Respond with ONLY the formatted value, no explanations.
+                                    '''
+                                    
+                                    format_response = llm.invoke(formatting_prompt)
+                                    return format_response.content.strip()
+                                    
+                                except Exception as e:
+                                    print(f"Error formatting value: {e}")
+                                    return str(value)
+
                             try:
                                 response_text = identified_columns.content
                                 x_y_columns = extract_json_from_text(response_text)
@@ -817,34 +1047,52 @@ def sql_main():
                                 x_axis = x_y_columns.get("x_axis")        
                                 y_axis = x_y_columns.get("y_axis")
                                 suggested_visual = x_y_columns.get("visualization")
+                                group_col = x_y_columns.get("group_col",None)
                                 
-                                if not x_axis or not y_axis:
-                                    st.warning("Unable to identify X and Y axis for visualization.")
-                                    st.stop()
-                            except Exception as e:
-                                st.error(f"Error processing LLM response: {str(e)}")
-                                st.stop()
-                                
-                            data_tab, visual_tab = st.tabs(["Data", "Visualization"])
+                                # Generate intelligent summary using LLM
+                                summary_text = generate_intelligent_summary(df, user_query, llm)
+                                if summary_text:
+                                    st.info(summary_text)
+                                else:
+                                    # Fallback to basic display if LLM summary fails
+                                    st.info("Query executed successfully. See results below.")
 
-                            with data_tab:
-                                st.dataframe(df, use_container_width=True)
+                                if not x_axis or not y_axis or df.shape[0] == 1:
+                                    # st.warning("Unable to identify X and Y axis for visualization.")
+                                    # Show only data table for simple results
+                                    st.dataframe(df, use_container_width=True)
+                                    # Show summary in words
+                                else:
+                                    data_tab, visual_tab = st.tabs(["Data", "Visualization"])
+                                    with data_tab:
+                                        st.dataframe(df, use_container_width=True)
+                                    try:
+                                        with visual_tab:
+                                            if df.shape[1] <= 10:
+                                                fig = create_visualization(df, x_axis, y_axis, suggested_visual, group_col)
+                                                if fig:
+                                                    st.pyplot(fig)
+                                                else:
+                                                    st.warning("Unable to create visualization with the current data.")
+                                            else:
+                                                st.warning("Dataframe contains too many columns for visualization.")
+                                    except Exception as chart_error:
+                                        with visual_tab:
+                                            st.info(f"Cannot visualize this data: {str(chart_error)}")
+                                            st.dataframe(df, use_container_width=True)
+                                    
+                                    # Prepare chart data - moved inside the else block and added condition check
+                                    if x_axis and y_axis:
+                                        try:
+                                            print(f"Visualization parameters: x_axis={x_axis}, y_axis={y_axis}, visual_type={suggested_visual}, group_col={group_col}")
+                                            print(f"DataFrame columns: {df.columns.tolist()}")
+                                            print(f"DataFrame sample:\n{df.head()}")
+                                        except Exception as debug_error:
+                                            print(f"Debug print error: {debug_error}")
+
+                            except Exception as e:
+                                st.error(f"Error creating visualization: {str(e)}")
                                 
-                            # Prepare chart data
-                            try:
-                                with visual_tab:
-                                    if df.shape[1] <= 10:
-                                        fig = create_visualization(df, x_axis, y_axis, suggested_visual)
-                                        if fig:
-                                            st.pyplot(fig)
-                                        else:
-                                            st.warning("Unable to create visualization with the current data.")
-                                    else:
-                                        st.warning("Dataframe contains too many columns for visualization.")
-                                                
-                            except Exception as chart_error:
-                                with visual_tab:
-                                    st.info(f"Cannot visualize this data: {str(chart_error)}")
                         except SQLAlchemyError as e:
                             st.error(f"SQL execution error: {str(e)}")
                             st.error(traceback.format_exc())
@@ -853,6 +1101,7 @@ def sql_main():
                     st.error(f"An error occurred: {str(e)}")
                     st.error(traceback.format_exc())
                     st.warning("Unable to process your request. Please try again.")
+
 
     # Sidebar usage instructions
     st.sidebar.markdown("### How to Use")

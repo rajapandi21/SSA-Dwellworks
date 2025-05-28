@@ -17,3 +17,4 @@ oracledb
 snowflake-connector-python
 snowflake-sqlalchemy
 snowflake-connector-python[pandas]
+numpy

@@ -4,6 +4,7 @@ from sqlalchemy import create_engine, inspect, MetaData, select, func, text
 from sqlalchemy.exc import SQLAlchemyError
 import logging
 import datetime
+import urllib.parse
 from urllib.parse import quote_plus
 
 # Set up logging
